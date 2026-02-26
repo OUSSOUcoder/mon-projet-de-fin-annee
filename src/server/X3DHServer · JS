@@ -1,0 +1,225 @@
+/**
+ * X3DH PreKey Store — Côté Serveur (Node.js)
+ * 
+ * Le serveur stocke UNIQUEMENT les clés publiques.
+ * Il ne peut jamais reconstituer un secret partagé.
+ *
+ * Responsabilités :
+ *   - Stocker les PreKeyBundles publiés par les clients
+ *   - Distribuer un bundle (avec 1 OTPK) à la demande
+ *   - Alerter quand le stock d'OTPKs est bas
+ *   - Recevoir de nouvelles OTPKs
+ */
+
+// ─────────────────────────────────────────────
+// STORE EN MÉMOIRE (remplacer par Redis ou DB en prod)
+// ─────────────────────────────────────────────
+
+const preKeyBundles = new Map(); // username → bundle complet
+const OTPK_LOW_THRESHOLD = 10;
+
+// ─────────────────────────────────────────────
+// GESTIONNAIRE SOCKET.IO
+// ─────────────────────────────────────────────
+
+/**
+ * À appeler dans votre fichier serveur principal :
+ *
+ *   const { registerX3DHHandlers } = require('./X3DHServer');
+ *   io.on('connection', socket => {
+ *     registerX3DHHandlers(io, socket);
+ *     // ... autres handlers
+ *   });
+ */
+function registerX3DHHandlers(io, socket) {
+
+  // ─── Publication d'un bundle complet ─────
+  socket.on('publish-prekey-bundle', ({ username, bundle }) => {
+    if (!username || !bundle) return;
+
+    // Valider la structure minimale
+    if (!bundle.identityKey || !bundle.signedPreKey || !bundle.oneTimePreKeys) {
+      socket.emit('error', { message: 'Bundle PreKey invalide' });
+      return;
+    }
+
+    // Conserver les OTPKs existantes si on republies
+    const existing = preKeyBundles.get(username);
+    const existingOTPKs = existing?.oneTimePreKeys || [];
+
+    // Fusionner les nouvelles OTPKs avec les existantes
+    const mergedOTPKs = [
+      ...existingOTPKs,
+      ...bundle.oneTimePreKeys.filter(
+        newKey => !existingOTPKs.find(old => old.id === newKey.id)
+      )
+    ];
+
+    const stored = {
+      ...bundle,
+      oneTimePreKeys: mergedOTPKs,
+      publishedAt: Date.now(),
+      lastSeen:    Date.now()
+    };
+
+    preKeyBundles.set(username, stored);
+
+    console.log(`📦 Bundle publié pour ${username} — ${mergedOTPKs.length} OTPKs disponibles`);
+
+    socket.emit('bundle-published', {
+      otpkCount: mergedOTPKs.length
+    });
+  });
+
+  // ─── Ajout de nouvelles OTPKs ────────────
+  socket.on('publish-new-prekeys', ({ oneTimePreKeys }) => {
+    const username = socket.data?.username;
+    if (!username) return;
+
+    const bundle = preKeyBundles.get(username);
+    if (!bundle) return;
+
+    const merged = [
+      ...bundle.oneTimePreKeys,
+      ...oneTimePreKeys.filter(
+        nk => !bundle.oneTimePreKeys.find(old => old.id === nk.id)
+      )
+    ];
+
+    bundle.oneTimePreKeys = merged;
+    preKeyBundles.set(username, bundle);
+
+    console.log(`📦 ${oneTimePreKeys.length} OTPKs ajoutées pour ${username} (total: ${merged.length})`);
+  });
+
+  // ─── Demande de bundle par Alice ─────────
+  socket.on('get-prekey-bundle', ({ username: targetUsername }) => {
+    const bundle = preKeyBundles.get(targetUsername);
+
+    if (!bundle) {
+      socket.emit(`prekey-bundle:${targetUsername}`, null);
+      console.log(`⚠️ Bundle introuvable pour ${targetUsername}`);
+      return;
+    }
+
+    // Préparer le bundle à envoyer :
+    // - identityKey + signedPreKey (permanents)
+    // - 1 seule OTPK (jetable) si disponible
+    let usedOTPK = null;
+    let remainingOTPKs = [...bundle.oneTimePreKeys];
+
+    if (remainingOTPKs.length > 0) {
+      // Prendre la première OTPK et la supprimer du stock
+      usedOTPK       = remainingOTPKs.shift();
+      bundle.oneTimePreKeys = remainingOTPKs;
+      preKeyBundles.set(targetUsername, bundle);
+    } else {
+      console.warn(`⚠️ Plus d'OTPKs pour ${targetUsername} — fallback sur SPK seule`);
+    }
+
+    // Bundle à envoyer (sans les autres OTPKs)
+    const bundleToSend = {
+      identityKey:    bundle.identityKey,
+      signedPreKey:   bundle.signedPreKey,
+      oneTimePreKeys: usedOTPK ? [usedOTPK] : [],
+      fetchedAt:      Date.now()
+    };
+
+    socket.emit(`prekey-bundle:${targetUsername}`, bundleToSend);
+    console.log(`📤 Bundle envoyé pour ${targetUsername} — OTPK: ${usedOTPK ? 'oui' : 'non (fallback)'}`);
+
+    // Alerter si stock bas
+    const count = bundle.oneTimePreKeys.length;
+    if (count < OTPK_LOW_THRESHOLD) {
+      // Notifier le propriétaire du bundle
+      const ownerSocket = findSocketByUsername(io, targetUsername);
+      if (ownerSocket) {
+        ownerSocket.emit('prekeys-low', { remaining: count });
+        console.log(`⚠️ Alerte OTPKs bas envoyée à ${targetUsername} (${count} restantes)`);
+      }
+    }
+  });
+
+  // ─── Mise à jour lastSeen ─────────────────
+  socket.on('update-prekey-timestamp', ({ username: u }) => {
+    const bundle = preKeyBundles.get(u);
+    if (bundle) {
+      bundle.lastSeen = Date.now();
+      preKeyBundles.set(u, bundle);
+    }
+  });
+}
+
+// ─────────────────────────────────────────────
+// ROUTES HTTP (optionnel, pour debug)
+// ─────────────────────────────────────────────
+
+/**
+ * À monter dans Express :
+ *   app.use('/api/x3dh', x3dhRouter);
+ */
+function createX3DHRouter(express) {
+  const router = express.Router();
+
+  // Stats (debug uniquement, désactiver en prod)
+  router.get('/stats', (req, res) => {
+    const stats = {};
+    for (const [username, bundle] of preKeyBundles.entries()) {
+      stats[username] = {
+        otpkCount:   bundle.oneTimePreKeys.length,
+        publishedAt: bundle.publishedAt,
+        lastSeen:    bundle.lastSeen
+      };
+    }
+    res.json(stats);
+  });
+
+  // Vérifier si un bundle existe
+  router.get('/bundle/:username/exists', (req, res) => {
+    const exists = preKeyBundles.has(req.params.username);
+    res.json({ exists, otpkCount: exists ? preKeyBundles.get(req.params.username).oneTimePreKeys.length : 0 });
+  });
+
+  return router;
+}
+
+// ─────────────────────────────────────────────
+// MAINTENANCE
+// ─────────────────────────────────────────────
+
+/**
+ * Nettoyer les bundles inactifs depuis plus de N jours.
+ * À appeler périodiquement (ex: cron daily).
+ */
+function cleanupInactiveBundles(daysInactive = 30) {
+  const cutoff = Date.now() - daysInactive * 24 * 60 * 60 * 1000;
+  let deleted = 0;
+
+  for (const [username, bundle] of preKeyBundles.entries()) {
+    if (bundle.lastSeen < cutoff) {
+      preKeyBundles.delete(username);
+      deleted++;
+    }
+  }
+
+  console.log(`🧹 ${deleted} bundles inactifs supprimés`);
+  return deleted;
+}
+
+// ─────────────────────────────────────────────
+// UTILITAIRE
+// ─────────────────────────────────────────────
+
+function findSocketByUsername(io, username) {
+  for (const [, socket] of io.sockets.sockets) {
+    if (socket.data?.username === username) return socket;
+  }
+  return null;
+}
+
+module.exports = {
+  registerX3DHHandlers,
+  createX3DHRouter,
+  cleanupInactiveBundles,
+  preKeyBundles  // export pour tests
+};
