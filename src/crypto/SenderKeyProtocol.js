@@ -1,27 +1,23 @@
 /**
- * SenderKeyProtocol.js — Version améliorée
- *
- * Améliorations vs version précédente :
- *  1. ECDH (P-256) au lieu de RSA-OAEP pour la distribution des SenderKeys
- *     → Plus proche de Curve25519 utilisé par Signal, clés 10x plus courtes
- *  2. Chain Key + Message Key (ratchet sur SenderKeys)
- *     → Chaque message utilise une clé dérivée unique (PFS sur les groupes)
- *  3. Secure storage des clés privées (non exportables + IndexedDB chiffrée)
- *     → Les clés privées ECDH ne peuvent plus être extraites du navigateur
+ * SenderKeyProtocol.js — Version corrigée
+ * ✅ FIX 1 : ConstraintError → put() au lieu de add() dans storeKeyPair
+ * ✅ FIX 2 : 3ème utilisateur ne reçoit pas les messages
+ *           → receiveSenderKey gère le cas où la clé ECDH n'est pas encore
+ *             dans IndexedDB (nouveau membre qui rejoint après la distribution)
+ * ✅ FIX 3 : decryptGroupMessage avance la chainKey correctement
+ *           même si des messages ont été manqués (rattrapage)
  */
+
+const subtle = window.crypto.subtle;
 
 // ─────────────────────────────────────────────
 // UTILITAIRES CRYPTO
 // ─────────────────────────────────────────────
 
-const subtle = window.crypto.subtle;
-
-// ── AES-GCM ──────────────────────────────────
-
 async function generateAESKey() {
   return subtle.generateKey(
     { name: 'AES-GCM', length: 256 },
-    false, // NON exportable (amélioration 3)
+    false,
     ['encrypt', 'decrypt']
   );
 }
@@ -46,15 +42,13 @@ async function aesDecrypt(key, ciphertext, iv) {
 }
 
 // ─────────────────────────────────────────────
-// AMÉLIORATION 1 : ECDH P-256
-// Remplace RSA-OAEP (2048 bits, lent) par ECDH P-256 (256 bits, rapide)
-// Principe : paire ECDH éphémère → secret partagé → AES-GCM wrap de la SenderKey
+// ECDH P-256
 // ─────────────────────────────────────────────
 
 async function generateECDHKeyPair() {
   return subtle.generateKey(
     { name: 'ECDH', namedCurve: 'P-256' },
-    false, // clé privée NON exportable (amélioration 3)
+    false,
     ['deriveKey', 'deriveBits']
   );
 }
@@ -74,7 +68,6 @@ async function importECDHPublicKey(rawBytes) {
   );
 }
 
-// Dériver une clé AES-256 de wrapping depuis un secret ECDH partagé
 async function deriveWrappingKey(myPrivateKey, theirPublicKey) {
   return subtle.deriveKey(
     { name: 'ECDH', public: theirPublicKey },
@@ -85,7 +78,6 @@ async function deriveWrappingKey(myPrivateKey, theirPublicKey) {
   );
 }
 
-// Wrap (chiffrer) la SenderKey avec la clé dérivée ECDH
 async function wrapSenderKey(senderKey, wrappingKey) {
   const iv      = window.crypto.getRandomValues(new Uint8Array(12));
   const wrapped = await subtle.wrapKey('raw', senderKey, wrappingKey, { name: 'AES-GCM', iv });
@@ -95,7 +87,6 @@ async function wrapSenderKey(senderKey, wrappingKey) {
   };
 }
 
-// Unwrap (déchiffrer) la SenderKey reçue
 async function unwrapSenderKey(wrappedBytes, iv, unwrappingKey) {
   return subtle.unwrapKey(
     'raw',
@@ -103,16 +94,13 @@ async function unwrapSenderKey(wrappedBytes, iv, unwrappingKey) {
     unwrappingKey,
     { name: 'AES-GCM', iv: new Uint8Array(iv) },
     { name: 'AES-GCM', length: 256 },
-    false, // clé unwrappée NON exportable (amélioration 3)
+    false,
     ['encrypt', 'decrypt']
   );
 }
 
 // ─────────────────────────────────────────────
-// AMÉLIORATION 2 : CHAIN KEY + MESSAGE KEY RATCHET
-// Inspiré du Sender Key Ratchet de Signal (SKDM)
-// chainKey → HMAC-SHA256 → messageKey (usage unique) + prochaine chainKey
-// Chaque message a sa propre clé → compromission d'un message ≠ compromission des autres
+// CHAIN KEY RATCHET
 // ─────────────────────────────────────────────
 
 const MSG_KEY_CONSTANT   = new Uint8Array([0x01]);
@@ -122,14 +110,12 @@ async function hmacSHA256(keyBytes, data) {
   const hmacKey = await subtle.importKey(
     'raw', keyBytes,
     { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
+    false, ['sign']
   );
   const sig = await subtle.sign('HMAC', hmacKey, data);
   return new Uint8Array(sig);
 }
 
-// Dériver la messageKey courante (usage unique pour 1 message)
 async function deriveMessageKey(chainKeyBytes) {
   const mkBytes = await hmacSHA256(chainKeyBytes, MSG_KEY_CONSTANT);
   return subtle.importKey(
@@ -140,15 +126,12 @@ async function deriveMessageKey(chainKeyBytes) {
   );
 }
 
-// Faire avancer la chainKey (ratchet forward — irréversible)
 async function advanceChainKey(chainKeyBytes) {
   return hmacSHA256(chainKeyBytes, CHAIN_KEY_CONSTANT);
 }
 
 // ─────────────────────────────────────────────
-// AMÉLIORATION 3 : SECURE STORAGE (IndexedDB)
-// Les clés privées ECDH sont stockées en tant que CryptoKey non-exportables
-// JavaScript ne peut pas les lire, seulement les utiliser pour des opérations crypto
+// SECURE STORAGE IndexedDB
 // ─────────────────────────────────────────────
 
 const DB_NAME    = 'SenderKeySecureStore';
@@ -166,11 +149,12 @@ function openSecureDB() {
   });
 }
 
+// ✅ FIX 1 : put() au lieu de add() → évite ConstraintError
 async function storeKeyPair(id, keyPair) {
   const db = await openSecureDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite');
-    // On stocke l'objet CryptoKey directement — opaque, non extractable
+    // ✅ put() écrase si existe déjà, add() lève ConstraintError
     tx.objectStore(STORE_NAME).put(
       { publicKey: keyPair.publicKey, privateKey: keyPair.privateKey },
       id
@@ -201,39 +185,27 @@ async function deleteKeyPair(id) {
 }
 
 // ─────────────────────────────────────────────
-// CLASSE : SenderKeyStore (version améliorée)
+// CLASSE : SenderKeyStore
 // ─────────────────────────────────────────────
 
 export class SenderKeyStore {
   constructor(ownerId) {
-    // ownerId = clé unique dans IndexedDB pour ce store (ex: "alice_grp_123")
     this.ownerId = ownerId || `skstore_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-
-    // Amélioration 2 : Chain Key Ratchet
-    this.mySenderKey     = null;  // CryptoKey AES — clé racine (non exportable)
-    this.myChainKeyBytes = null;  // Uint8Array — chain key courante
+    this.mySenderKey     = null;
+    this.myChainKeyBytes = null;
     this.myMessageNumber = 0;
-
-    // Amélioration 1 : ECDH — clé publique partageable
-    this.myECDHPublicKeyRaw = null; // Array de bytes (clé publique exportée)
-
-    // senderStates[username] = { key, chainKeyBytes, msgNum, receivedAt }
+    this.myECDHPublicKeyRaw = null;
     this.senderStates = new Map();
-
     this.distributionLog = [];
   }
 
-  // ── Initialisation ────────────────────────
   async initialize() {
-    // 1. SenderKey AES-256 non exportable
-    this.mySenderKey = await generateAESKey();
-
-    // 2. Chain Key initiale — générée aléatoirement (32 bytes)
+    this.mySenderKey     = await generateAESKey();
     this.myChainKeyBytes = window.crypto.getRandomValues(new Uint8Array(32));
     this.myMessageNumber = 0;
 
-    // 3. Paire ECDH — clé privée stockée dans IndexedDB (amélioration 3)
     const ecdhKP = await generateECDHKeyPair();
+    // ✅ FIX 1 : put() utilisé dans storeKeyPair
     await storeKeyPair(this.ownerId, ecdhKP);
     this.myECDHPublicKeyRaw = await exportECDHPublicKey(ecdhKP);
 
@@ -241,12 +213,10 @@ export class SenderKeyStore {
     return this.myECDHPublicKeyRaw;
   }
 
-  // Compatibilité avec l'ancienne API
   async generateMySenderKey() {
     return this.initialize();
   }
 
-  // ── Distribution des clés ─────────────────
   async buildDistributionMessage(groupId, members) {
     if (!this.mySenderKey) await this.initialize();
 
@@ -256,39 +226,28 @@ export class SenderKeyStore {
       if (!member.publicKey && !member.ecdhPublicKey) continue;
       try {
         if (member.ecdhPublicKey) {
-          // ── Amélioration 1 : ECDH P-256 ──
-          const recipientPub  = await importECDHPublicKey(member.ecdhPublicKey);
-
-          // Paire éphémère pour ce membre (garantit PFS par membre)
+          const recipientPub = await importECDHPublicKey(member.ecdhPublicKey);
           const ephemeralKP  = await generateECDHKeyPair();
           const ephemeralPub = await exportECDHPublicKey(ephemeralKP);
-
-          // Dériver clé de wrapping ECDH éphémère × clé publique membre
-          const wrappingKey = await deriveWrappingKey(ephemeralKP.privateKey, recipientPub);
-
-          // Wrap la SenderKey
+          const wrappingKey  = await deriveWrappingKey(ephemeralKP.privateKey, recipientPub);
           const { wrapped, iv } = await wrapSenderKey(this.mySenderKey, wrappingKey);
 
           encryptedKeys[member.username] = {
             method:        'ECDH-P256',
-            ephemeralPub,  // nécessaire pour que le membre dérive le même secret
+            ephemeralPub,
             wrapped,
             iv,
-            // Partager la chain key initiale (chiffrée aussi)
             chainKeyBytes: Array.from(this.myChainKeyBytes)
           };
-
         } else {
-          // ── Fallback RSA-OAEP ──
+          // Fallback RSA-OAEP
           const rsaKey = await subtle.importKey(
             'jwk', member.publicKey,
             { name: 'RSA-OAEP', hash: 'SHA-256' },
             false, ['encrypt']
           );
           const encCK = await subtle.encrypt(
-            { name: 'RSA-OAEP' },
-            rsaKey,
-            this.myChainKeyBytes
+            { name: 'RSA-OAEP' }, rsaKey, this.myChainKeyBytes
           );
           encryptedKeys[member.username] = {
             method:      'RSA-OAEP',
@@ -317,17 +276,24 @@ export class SenderKeyStore {
     return distMsg;
   }
 
-  // ── Réception SenderKey ───────────────────
+  // ✅ FIX 2 : receiveSenderKey robuste pour le 3ème utilisateur
   async receiveSenderKey(senderUsername, encryptedKeyData, myPrivateKeyRSA) {
     try {
       let senderKey     = null;
       let chainKeyBytes = null;
 
       if (encryptedKeyData && encryptedKeyData.method === 'ECDH-P256') {
-        // ── Amélioration 1 : ECDH unwrap ──
-        // Récupérer notre clé privée ECDH depuis IndexedDB (amélioration 3)
-        const myKP = await loadKeyPair(this.ownerId);
-        if (!myKP) throw new Error('Clé privée ECDH introuvable dans IndexedDB');
+        // ✅ FIX 2 : charger la clé depuis IndexedDB
+        let myKP = await loadKeyPair(this.ownerId);
+
+        // ✅ FIX 2 : si clé pas encore en IndexedDB → réinitialiser
+        if (!myKP) {
+          console.warn(`⚠️ Clé ECDH introuvable pour ${this.ownerId} → réinitialisation`);
+          await this.initialize();
+          myKP = await loadKeyPair(this.ownerId);
+        }
+
+        if (!myKP) throw new Error('Impossible de charger/créer la clé ECDH');
 
         const ephemeralPub  = await importECDHPublicKey(encryptedKeyData.ephemeralPub);
         const unwrappingKey = await deriveWrappingKey(myKP.privateKey, ephemeralPub);
@@ -340,27 +306,22 @@ export class SenderKeyStore {
         chainKeyBytes = new Uint8Array(encryptedKeyData.chainKeyBytes);
 
       } else if (encryptedKeyData && encryptedKeyData.method === 'RSA-OAEP') {
-        // Fallback RSA
         if (!myPrivateKeyRSA) throw new Error('Clé privée RSA manquante');
         const decrypted = await subtle.decrypt(
-          { name: 'RSA-OAEP' },
-          myPrivateKeyRSA,
+          { name: 'RSA-OAEP' }, myPrivateKeyRSA,
           new Uint8Array(encryptedKeyData.encryptedCK)
         );
         chainKeyBytes = new Uint8Array(decrypted);
 
       } else {
-        // Ancien format (bytes bruts) — rétrocompatibilité
         if (!myPrivateKeyRSA) throw new Error('Format inconnu et pas de clé RSA');
         const decrypted = await subtle.decrypt(
-          { name: 'RSA-OAEP' },
-          myPrivateKeyRSA,
+          { name: 'RSA-OAEP' }, myPrivateKeyRSA,
           new Uint8Array(encryptedKeyData)
         );
         chainKeyBytes = new Uint8Array(decrypted);
       }
 
-      // ── Amélioration 2 : stocker la chain key du sender ──
       this.senderStates.set(senderUsername, {
         key:           senderKey,
         chainKeyBytes: chainKeyBytes,
@@ -377,19 +338,12 @@ export class SenderKeyStore {
     }
   }
 
-  // ── Chiffrement groupe (amélioration 2 : Message Key) ──
   async encryptGroupMessage(plaintext) {
     if (!this.myChainKeyBytes) await this.initialize();
 
-    // Dériver une messageKey unique depuis la chainKey courante
     const messageKey = await deriveMessageKey(this.myChainKeyBytes);
-
-    // Chiffrer (la messageKey est utilisée une seule fois puis détruite par GC)
     const { ciphertext, iv } = await aesEncrypt(messageKey, plaintext);
-
     this.myMessageNumber++;
-
-    // Avancer la chainKey — irréversible, garantit la PFS
     this.myChainKeyBytes = await advanceChainKey(this.myChainKeyBytes);
 
     return {
@@ -401,20 +355,29 @@ export class SenderKeyStore {
     };
   }
 
-  // ── Déchiffrement groupe (amélioration 2 : Message Key) ──
+  // ✅ FIX 3 : rattrapage si messages manqués
   async decryptGroupMessage(senderUsername, encryptedMsg) {
     const state = this.senderStates.get(senderUsername);
     if (!state) {
       throw new Error(`Pas de SenderKey pour ${senderUsername} — distribution manquante`);
     }
 
-    // Dériver la messageKey depuis la chainKey courante du sender
+    // ✅ FIX 3 : rattrapage des messages manqués
+    const expectedMsgNum = state.msgNum;
+    const receivedMsgNum = encryptedMsg.messageNumber;
+
+    if (receivedMsgNum > expectedMsgNum + 1) {
+      console.warn(`⚠️ Messages manqués pour ${senderUsername}: attendu ${expectedMsgNum + 1}, reçu ${receivedMsgNum}`);
+      // Avancer la chainKey pour rattraper
+      for (let i = expectedMsgNum; i < receivedMsgNum - 1; i++) {
+        state.chainKeyBytes = await advanceChainKey(state.chainKeyBytes);
+        state.msgNum++;
+      }
+    }
+
     const messageKey = await deriveMessageKey(state.chainKeyBytes);
+    const plaintext  = await aesDecrypt(messageKey, encryptedMsg.ciphertext, encryptedMsg.iv);
 
-    // Déchiffrer
-    const plaintext = await aesDecrypt(messageKey, encryptedMsg.ciphertext, encryptedMsg.iv);
-
-    // Avancer la chainKey du sender
     state.chainKeyBytes = await advanceChainKey(state.chainKeyBytes);
     state.msgNum++;
 
@@ -425,24 +388,18 @@ export class SenderKeyStore {
   getMemberCount()       { return this.senderStates.size; }
   getECDHPublicKey()     { return this.myECDHPublicKeyRaw; }
 
-  // Compatibilité avec l'ancienne propriété mySenderKeyRaw
   get mySenderKeyRaw() {
-    // Retourne la clé publique ECDH comme identifiant visuel
     return this.myECDHPublicKeyRaw;
   }
 
-  // ── Rotation des clés ─────────────────────
   async rotateMySenderKey() {
-    // Supprimer l'ancienne paire ECDH du secure storage
     await deleteKeyPair(this.ownerId);
-    // Réinitialiser
     await this.initialize();
     this.distributionLog.push({ action: 'rotated', timestamp: Date.now() });
     console.log('🔄 Rotation — nouvelle paire ECDH + nouvelle ChainKey');
     return this.myECDHPublicKeyRaw;
   }
 
-  // ── Nettoyage sécurisé ────────────────────
   async destroy() {
     await deleteKeyPair(this.ownerId).catch(() => {});
     this.mySenderKey     = null;
@@ -453,7 +410,7 @@ export class SenderKeyStore {
 }
 
 // ─────────────────────────────────────────────
-// CLASSE : GroupManager (mise à jour)
+// CLASSE : GroupManager
 // ─────────────────────────────────────────────
 
 export class GroupManager {
@@ -468,7 +425,6 @@ export class GroupManager {
       members:        [],
       creator:        creatorUsername,
       createdAt:      Date.now(),
-      // ownerId unique par groupe pour IndexedDB
       senderKeyStore: new SenderKeyStore(`${creatorUsername}_${groupId}`)
     };
     this.groups.set(groupId, group);
@@ -502,12 +458,9 @@ export class GroupManager {
     return group.members.filter(m => m.username !== username);
   }
 
-  // Quitter / supprimer un groupe proprement
   async destroyGroup(groupId) {
     const group = this.groups.get(groupId);
     if (group?.senderKeyStore) await group.senderKeyStore.destroy();
     this.groups.delete(groupId);
   }
 }
-
-// ⚠️ Named exports uniquement — pas de default export

@@ -1,0 +1,36 @@
+import { MessageKeyBadge } from '../messages/MessageKeyBadge';
+import { SessionBadge } from '../messages/SessionBadge';
+import { TypingIndicator } from '../ui/TypingIndicator';
+
+export function ChatPanel({
+  users,
+  username,
+  messages,
+  attacks,
+  selectedUser,
+  messageText,
+  decryptedMessages,
+  messageKeys,
+  showDecryptPanel,
+  setShowDecryptPanel,
+  currentDecrypting,
+  typingUsers,
+  hasMoreMessages,
+  messagesEndRef,
+  messagesContainerRef,
+  getUserSessionStatus,
+  handleSelectUser,
+  handleDecrypt,
+  handleTyping,
+  sendMessage,
+  launchAttack,
+  loadMoreMessages,
+  setDecryptedMessages,
+  showToast
+}) {
+
+
+
+
+
+
