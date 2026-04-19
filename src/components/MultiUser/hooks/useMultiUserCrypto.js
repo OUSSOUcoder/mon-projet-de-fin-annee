@@ -86,7 +86,8 @@ export function useMultiUserCrypto({
           x3dhId = await idStorage.loadIdentity(username, password);
           showToast('🔑 Identité X3DH chargée depuis le stockage', 'success');
         } catch {
-          showToast('⚠️ Mot de passe incorrect, nouvelle identité X3DH générée', 'warning');
+          // ✅ FIX : message correct — mauvais mot de passe ou autre appareil
+          showToast('⚠️ Impossible de charger l\'identité existante — nouvelle identité créée', 'info');
           x3dhId = await new X3DHIdentity().generate();
           await idStorage.saveIdentity(username, x3dhId, password);
         }
@@ -113,6 +114,7 @@ export function useMultiUserCrypto({
       setJoined(true);
       showToast('🔐 Connexion sécurisée à la room', 'info');
 
+      // ✅ Charger les contacts vérifiés (stockés par username)
       const savedVerified = await idStorage.loadVerifiedContacts(username);
       if (savedVerified.size > 0) {
         setVerifiedContacts(savedVerified);
@@ -163,11 +165,10 @@ export function useMultiUserCrypto({
               const { sessionKey } = await x3dhReceiverProcess(x3dhIdentityRef.current, msg.x3dhInit);
               await idStorage.updateIdentity(username, x3dhIdentityRef.current, password);
               setOtpkCount(x3dhIdentityRef.current.getRemainingOneTimePreKeyCount());
-              const isInitiator = username.localeCompare(contactId) < 0;
-              ratchet = new DHRatchet(sessionKey, isInitiator);
+              // ✅ FIX : isInitiator=true pour que sendingChain soit créée des deux côtés
+              ratchet = new DHRatchet(sessionKey, true);
               const senderIdKey = await importPublicKey(msg.x3dhInit.senderIdentityKey);
-              if (isInitiator) await ratchet.initialize(await generateECDHKeyPair(), senderIdKey);
-              else await ratchet.initialize(x3dhIdentityRef.current.identityKeyPair, null);
+              await ratchet.initialize(await generateECDHKeyPair(), senderIdKey);
               showToast('✅ Session X3DH établie', 'success');
             } catch (e) { console.warn('X3DH échoué, fallback ECDH:', e.message); }
           }
@@ -180,10 +181,9 @@ export function useMultiUserCrypto({
             const senderIdKey  = await importPublicKey(senderIdJWK);
             const sharedSecret = await performECDH(myKP.privateKey, senderIdKey);
             const rootKey      = await hkdf(sharedSecret, new Uint8Array(32), new TextEncoder().encode('X3DH-session'), 32);
-            const isInitiator  = username.localeCompare(contactId) < 0;
-            ratchet = new DHRatchet(rootKey, isInitiator);
-            if (isInitiator) await ratchet.initialize(await generateECDHKeyPair(), senderIdKey);
-            else await ratchet.initialize(myKP, null);
+            // ✅ FIX : isInitiator=true pour que sendingChain soit créée
+            ratchet = new DHRatchet(rootKey, true);
+            await ratchet.initialize(await generateECDHKeyPair(), senderIdKey);
           }
 
           ratchetsRef.current.set(contactId, ratchet);
@@ -265,13 +265,10 @@ export function useMultiUserCrypto({
       return;
     }
 
-    if (!verifiedContacts.has(selectedUser.id) && !pendingSend) {
-      showToast(`⚠️ ${selectedUser.username} n'est pas vérifié — cliquez à nouveau pour envoyer quand même`, 'warning');
-      setPendingSend(true);
-      setTimeout(() => setPendingSend(false), 5000);
-      return;
+    // ✅ FIX : avertissement non-bloquant — le message part au 1er clic
+    if (!verifiedContacts.has(selectedUser.username)) {
+      showToast(`⚠️ ${selectedUser.username} non vérifié — pensez à vérifier le Safety Number`, 'info');
     }
-    setPendingSend(false);
 
     try {
       if (!serverSigningPublicKey) throw new Error('Clé serveur manquante');
@@ -295,11 +292,10 @@ export function useMultiUserCrypto({
             if (bundle) {
               const { sessionKey, initialMessage } = await x3dhSenderInitiate(x3dhIdentityRef.current, bundle);
               x3dhInitMsg = initialMessage;
-              const isInitiator = username.localeCompare(contactId) < 0;
-              ratchet = new DHRatchet(sessionKey, isInitiator);
+              // ✅ FIX : isInitiator=true → sendingChain toujours créée
+              ratchet = new DHRatchet(sessionKey, true);
               const spkPub = await importPublicKey(bundle.signedPreKey.publicKey);
-              if (isInitiator) await ratchet.initialize(await generateECDHKeyPair(), spkPub);
-              else await ratchet.initialize(x3dhIdentityRef.current.identityKeyPair, null);
+              await ratchet.initialize(await generateECDHKeyPair(), spkPub);
               showToast(`✅ Session X3DH initiée avec ${contactId}`, 'success');
             }
           } catch (e) { console.warn('X3DH envoi échoué, fallback ECDH:', e.message); }
@@ -313,10 +309,9 @@ export function useMultiUserCrypto({
           const recipIdKey   = await importPublicKey(recipIdJWK);
           const sharedSecret = await performECDH(myKP.privateKey, recipIdKey);
           const rootKey      = await hkdf(sharedSecret, new Uint8Array(32), new TextEncoder().encode('X3DH-session'), 32);
-          const isInitiator  = username.localeCompare(contactId) < 0;
-          ratchet = new DHRatchet(rootKey, isInitiator);
-          if (isInitiator) await ratchet.initialize(await generateECDHKeyPair(), recipIdKey);
-          else await ratchet.initialize(myKP, null);
+          // ✅ FIX : isInitiator=true → sendingChain toujours créée
+          ratchet = new DHRatchet(rootKey, true);
+          await ratchet.initialize(await generateECDHKeyPair(), recipIdKey);
         }
 
         ratchetsRef.current.set(contactId, ratchet);
