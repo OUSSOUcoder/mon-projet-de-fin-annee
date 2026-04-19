@@ -1,18 +1,37 @@
 import { useState, useEffect } from 'react';
 
 // ─────────────────────────────────────────────
+// Normalise un objet JWK en triant ses clés alphabétiquement
+// Garantit le même JSON.stringify() peu importe l'ordre d'insertion
+// ─────────────────────────────────────────────
+function normalizeJWK(jwk) {
+  return Object.keys(jwk)
+    .sort()
+    .reduce((acc, key) => { acc[key] = jwk[key]; return acc; }, {});
+}
+
+// ─────────────────────────────────────────────
 // Calcule le Safety Number à partir de deux clés publiques JWK
 // Même principe que Signal : SHA-256(keyA || keyB) → 12 groupes de 5 chiffres
 // ─────────────────────────────────────────────
 async function computeSafetyNumber(myPublicKeyJWK, theirPublicKeyJWK) {
   if (!myPublicKeyJWK || !theirPublicKeyJWK) return null;
 
-  // Sérialiser les deux clés de façon déterministe
-  const encA = new TextEncoder().encode(JSON.stringify(myPublicKeyJWK));
-  const encB = new TextEncoder().encode(JSON.stringify(theirPublicKeyJWK));
+  // ✅ FIX : normaliser les deux clés avant de les sérialiser
+  // Garantit le même JSON.stringify() des deux côtés
+  const normA = normalizeJWK(typeof myPublicKeyJWK === 'string'
+    ? JSON.parse(myPublicKeyJWK) : myPublicKeyJWK);
+  const normB = normalizeJWK(typeof theirPublicKeyJWK === 'string'
+    ? JSON.parse(theirPublicKeyJWK) : theirPublicKeyJWK);
 
-  // Concaténer dans l'ordre lexicographique (même résultat des deux côtés)
-  const sorted = JSON.stringify(myPublicKeyJWK) < JSON.stringify(theirPublicKeyJWK)
+  const strA = JSON.stringify(normA);
+  const strB = JSON.stringify(normB);
+
+  const encA = new TextEncoder().encode(strA);
+  const encB = new TextEncoder().encode(strB);
+
+  // ✅ Trier lexicographiquement → même ordre des deux côtés
+  const sorted = strA < strB
     ? new Uint8Array([...encA, ...encB])
     : new Uint8Array([...encB, ...encA]);
 
@@ -20,7 +39,6 @@ async function computeSafetyNumber(myPublicKeyJWK, theirPublicKeyJWK) {
   const bytes   = new Uint8Array(hashBuf);
 
   // → 12 groupes de 5 chiffres (comme Signal)
-  // On prend 60 bits (7.5 octets) par groupe → simplification : 2 octets → nombre 0-99999
   const groups = [];
   for (let i = 0; i < 12; i++) {
     const offset = i * 2;
@@ -47,10 +65,10 @@ function groupColor(group) {
 // COMPOSANT PRINCIPAL
 // ─────────────────────────────────────────────
 export function SafetyNumber({ myPublicKeyJWK, theirPublicKeyJWK, theirUsername, onClose }) {
-  const [groups, setGroups]       = useState(null);
-  const [verified, setVerified]   = useState(false);
-  const [loading, setLoading]     = useState(true);
-  const [copied, setCopied]       = useState(false);
+  const [groups, setGroups]     = useState(null);
+  const [verified, setVerified] = useState(false);
+  const [loading, setLoading]   = useState(true);
+  const [copied, setCopied]     = useState(false);
 
   useEffect(() => {
     setLoading(true);
@@ -98,7 +116,7 @@ export function SafetyNumber({ myPublicKeyJWK, theirPublicKeyJWK, theirUsername,
             <p>Comparez ce numéro avec {theirUsername} via un autre canal (appel, SMS). S'il correspond, votre communication n'est pas interceptée.</p>
           </div>
 
-          {/* Grille des groupes — style Signal */}
+          {/* Grille des groupes */}
           {loading ? (
             <div className="flex items-center justify-center py-8">
               <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
@@ -161,7 +179,7 @@ export function SafetyNumber({ myPublicKeyJWK, theirPublicKeyJWK, theirUsername,
 }
 
 // ─────────────────────────────────────────────
-// Badge compact à afficher dans la liste des participants
+// Badge compact
 // ─────────────────────────────────────────────
 export function SafetyNumberBadge({ verified, onClick }) {
   return (

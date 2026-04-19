@@ -308,7 +308,8 @@ function MultiUserSimulation() {
         {safetyNumberTarget && (
           <SafetyNumber
             myPublicKeyJWK={myIdentityPublicJWKRef.current}
-            theirPublicKeyJWK={safetyNumberTarget.publicKey}
+           
+             theirPublicKeyJWK={safetyNumberTarget.identityKey} 
             theirUsername={safetyNumberTarget.username}
             onClose={() => {
               setVerifiedContacts(prev => new Set([...prev, safetyNumberTarget.id]));
