@@ -86,7 +86,6 @@ export function useMultiUserCrypto({
           x3dhId = await idStorage.loadIdentity(username, password);
           showToast('🔑 Identité X3DH chargée depuis le stockage', 'success');
         } catch {
-          // ✅ FIX : message correct — mauvais mot de passe ou autre appareil
           showToast('⚠️ Impossible de charger l\'identité existante — nouvelle identité créée', 'info');
           x3dhId = await new X3DHIdentity().generate();
           await idStorage.saveIdentity(username, x3dhId, password);
@@ -114,7 +113,6 @@ export function useMultiUserCrypto({
       setJoined(true);
       showToast('🔐 Connexion sécurisée à la room', 'info');
 
-      // ✅ Charger les contacts vérifiés (stockés par username)
       const savedVerified = await idStorage.loadVerifiedContacts(username);
       if (savedVerified.size > 0) {
         setVerifiedContacts(savedVerified);
@@ -160,19 +158,60 @@ export function useMultiUserCrypto({
         let ratchet = ratchetsRef.current.get(contactId);
 
         if (!ratchet) {
+          // ──────────────────────────────────────────────────────────────────
+          // BRANCHE X3DH — RÉCEPTEUR
+          //
+          // RÈGLE FONDAMENTALE du Double Ratchet :
+          //   Émetteur  → isInitiator=true,  dhKeyPair=nouvelle paire aléatoire,
+          //               dhRemotePublicKey=SPK du récepteur
+          //               → performDHRatchetStep() crée sendingChain via :
+          //                 ECDH(newKey.private, SPK.public)
+          //
+          //   Récepteur → isInitiator=false, dhKeyPair=SPK du récepteur,
+          //               dhRemotePublicKey=null (pas encore de step DH)
+          //               → receiveDHRatchet() créera receivingChain via :
+          //                 ECDH(SPK.private, newKey.public)  ← symétrique ✓
+          //
+          // ❌ AVANT (bug) : isInitiator=true + nouvelle clé aléatoire
+          //    → performDHRatchetStep() recalcule une sendingChain différente
+          //    → les messageKey divergent → HMAC échoue toujours
+          // ──────────────────────────────────────────────────────────────────
+
           if (msg.x3dhInit && x3dhIdentityRef.current) {
             try {
-              const { sessionKey } = await x3dhReceiverProcess(x3dhIdentityRef.current, msg.x3dhInit);
+              // x3dhReceiverProcess DOIT retourner { sessionKey, spkKeyPair }
+              // Voir note en bas de fichier sur la modification X3DH.js requise
+              const { sessionKey, spkKeyPair } = await x3dhReceiverProcess(
+                x3dhIdentityRef.current,
+                msg.x3dhInit
+              );
               await idStorage.updateIdentity(username, x3dhIdentityRef.current, password);
               setOtpkCount(x3dhIdentityRef.current.getRemainingOneTimePreKeyCount());
-              // ✅ FIX : isInitiator=true pour que sendingChain soit créée des deux côtés
-              ratchet = new DHRatchet(sessionKey, true);
-              const senderIdKey = await importPublicKey(msg.x3dhInit.senderIdentityKey);
-              await ratchet.initialize(await generateECDHKeyPair(), senderIdKey);
+
+              // ✅ FIX : isInitiator=false → pas de performDHRatchetStep() à l'init
+              // ✅ FIX : spkKeyPair comme dhKeyPair → ECDH symétrique avec l'émetteur
+              ratchet = new DHRatchet(sessionKey, false);
+              await ratchet.initialize(spkKeyPair, null);
+
               showToast('✅ Session X3DH établie', 'success');
-            } catch (e) { console.warn('X3DH échoué, fallback ECDH:', e.message); }
+            } catch (e) {
+              console.warn('X3DH échoué, fallback ECDH:', e.message);
+            }
           }
 
+          // ──────────────────────────────────────────────────────────────────
+          // FALLBACK ECDH — RÉCEPTEUR
+          //
+          // L'émetteur a fait :
+          //   sharedSecret = ECDH(émetteur.identityKey.private, récepteur.identityKey.public)
+          //   rootKey = HKDF(sharedSecret, ...)
+          //   ratchet = new DHRatchet(rootKey, true)
+          //   initialize(newKeyPair, récepteur.identityKey.public)
+          //   → sendingChain = ECDH(newKeyPair.private, récepteur.identityKey.public)
+          //
+          // Donc le récepteur doit avoir dhKeyPair = myIdentityKeyPair
+          // pour que ECDH(myIdentityKey.private, sender.newKey.public) matche ✓
+          // ──────────────────────────────────────────────────────────────────
           if (!ratchet) {
             const myKP = myIdentityKeyPairRef.current;
             if (!myKP) throw new Error('Identité ECDH locale manquante');
@@ -181,9 +220,10 @@ export function useMultiUserCrypto({
             const senderIdKey  = await importPublicKey(senderIdJWK);
             const sharedSecret = await performECDH(myKP.privateKey, senderIdKey);
             const rootKey      = await hkdf(sharedSecret, new Uint8Array(32), new TextEncoder().encode('X3DH-session'), 32);
-            // ✅ FIX : isInitiator=true pour que sendingChain soit créée
-            ratchet = new DHRatchet(rootKey, true);
-            await ratchet.initialize(await generateECDHKeyPair(), senderIdKey);
+
+            // ✅ FIX : isInitiator=false + myKP comme dhKeyPair
+            ratchet = new DHRatchet(rootKey, false);
+            await ratchet.initialize(myKP, null);
           }
 
           ratchetsRef.current.set(contactId, ratchet);
@@ -222,6 +262,7 @@ export function useMultiUserCrypto({
         return;
       }
 
+      // ── Fallback legacy (non-sealed) ──────────────────────────────────────
       const sender = usersRef.current.find(u => u.username === msg.from);
       if (!sender) throw new Error('Expéditeur introuvable');
       if (!msg.encryptedData?.ciphertext) throw new Error('Données chiffrées manquantes');
@@ -265,7 +306,6 @@ export function useMultiUserCrypto({
       return;
     }
 
-    // ✅ FIX : avertissement non-bloquant — le message part au 1er clic
     if (!verifiedContacts.has(selectedUser.username)) {
       showToast(`⚠️ ${selectedUser.username} non vérifié — pensez à vérifier le Safety Number`, 'info');
     }
@@ -281,6 +321,12 @@ export function useMultiUserCrypto({
       if (!ratchet) {
         markSession(selectedUser.id, 'pending');
 
+        // ──────────────────────────────────────────────────────────────────
+        // ÉMETTEUR — isInitiator=true est CORRECT ici
+        // initialize(newKeyPair, spkPub) → performDHRatchetStep() crée sendingChain
+        // via ECDH(newKeyPair.private, spkPub)
+        // Le récepteur calcule le symétrique avec son spkKeyPair.private ✓
+        // ──────────────────────────────────────────────────────────────────
         if (x3dhIdentityRef.current) {
           try {
             const bundlePromise = new Promise((resolve, reject) => {
@@ -292,7 +338,6 @@ export function useMultiUserCrypto({
             if (bundle) {
               const { sessionKey, initialMessage } = await x3dhSenderInitiate(x3dhIdentityRef.current, bundle);
               x3dhInitMsg = initialMessage;
-              // ✅ FIX : isInitiator=true → sendingChain toujours créée
               ratchet = new DHRatchet(sessionKey, true);
               const spkPub = await importPublicKey(bundle.signedPreKey.publicKey);
               await ratchet.initialize(await generateECDHKeyPair(), spkPub);
@@ -309,7 +354,6 @@ export function useMultiUserCrypto({
           const recipIdKey   = await importPublicKey(recipIdJWK);
           const sharedSecret = await performECDH(myKP.privateKey, recipIdKey);
           const rootKey      = await hkdf(sharedSecret, new Uint8Array(32), new TextEncoder().encode('X3DH-session'), 32);
-          // ✅ FIX : isInitiator=true → sendingChain toujours créée
           ratchet = new DHRatchet(rootKey, true);
           await ratchet.initialize(await generateECDHKeyPair(), recipIdKey);
         }
@@ -359,3 +403,29 @@ export function useMultiUserCrypto({
 
   return { joinRoom, sendMessage, handleDecrypt };
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MODIFICATION REQUISE dans X3DH.js — x3dhReceiverProcess
+//
+// La fonction doit retourner { sessionKey, spkKeyPair } au lieu de { sessionKey }
+// pour que le récepteur puisse initialiser le ratchet avec la bonne paire de clés.
+//
+// Exemple de ce que x3dhReceiverProcess doit retourner :
+//
+//   export async function x3dhReceiverProcess(identity, x3dhInit) {
+//     // ... calcul du sessionKey existant ...
+//     const spkKeyPair = await identity.getSignedPreKeyPair(x3dhInit.usedSPKId);
+//     return {
+//       sessionKey,
+//       spkKeyPair   // ← AJOUTER CECI
+//     };
+//   }
+//
+// Et dans X3DHIdentity, ajouter la méthode :
+//
+//   async getSignedPreKeyPair(spkId) {
+//     // retourner la paire { publicKey, privateKey } du SPK utilisé
+//     return this.signedPreKey; // ou this.signedPreKeys.get(spkId)
+//   }
+//
+// ══════════════════════════════════════════════════════════════════════════════
